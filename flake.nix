@@ -3,6 +3,7 @@
   inputs = { nixpkgs.url = "github:nixos/nixpkgs/nixos-25.05"; };
 
   outputs = inputs@{ nixpkgs, ... }: {
+
     nixosModules.default = { config, inputs, pkgs, lib, ... }: {
       options = let
         strongStateDetails = lib.types.submodule ({ name, ... }: {
@@ -25,10 +26,27 @@
       config = let
         enabledServices =
           lib.filter (ea: ea.enabled) (lib.attrValues config.strongStateDir);
+        mkStrongStateDirSrc = builtins.readFile ./strongStateDir;
+        mkStrongStateDir = (pkgs.writeScriptBin "mkStrongStateDir"
+          mkStrongStateDirSrc).overrideAttrs (p: {
+            buildCommand = ''
+              ${p.buildCommand}
+              patchShebangs $out
+            '';
+          });
+        wrappedMkStrongStateDir = pkgs.symlinkJoin {
+          name = "mkStrongStateDir";
+          paths = [ mkStrongStateDir ]
+            ++ (with pkgs; [ gzip openssh gnugrep util-linux ]);
+          buildInputs = [ pkgs.makeWrapper ];
+          postBuild =
+            "wrapProgram $out/bin/mkStrongStateDir --prefix PATH : $out/bin";
+        };
       in {
         environment.etc.strongStateDir = {
-          text =
-            lib.concatStringsSep "|" (map (ea: ea.serviceName) enabledServices);
+          text = "${wrappedMkStrongStateDir}/bin/mkStrongStateDir "
+            + (lib.concatStringsSep " "
+              (map (ea: lib.escapeShellArg ea.serviceName) enabledServices));
         };
       };
     };

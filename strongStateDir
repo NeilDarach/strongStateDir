@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Ensure that the dataset zroot/strong/strongStateDir/{NAME} is mounted under /strongStateDir
+# If it isn't, then
+#   create it if necessary
+#   restore from backup if available
+#   mount it
+# If the dataset was created, then chown it
+# Args are passed as colon separated <dirName>:owner:group:<nameonbackup>
+
+usage() {
+    echo "$0 <name>:<user>:<group>:<backup>"
+}
+
+if [[ $# != 1 ]]; then
+    usage
+    exit 1
+fi
+IFS=':' read -ra ARGS <<<"$1"
+NAME=${ARGS[0]}
+USR=${ARGS[1]}
+GROUP=${ARGS[2]}
+BACKUP="datapool/backups/${ARGS[3]}"
+CREATED=FALSE
+SRC_DATASET="zroot/strong/strongStateDir/${NAME}"
+
+if [[ ! -d "/strongStateDir/${NAME}" ]]; then
+    echo "No mountpoint, creating it"
+    mkdir -p "/strongStateDir/${NAME}"
+fi
+
+if ! zfs list "${SRC_DATASET}" >/dev/null 2>&1; then
+    echo "Dataset ${SRC_DATASET} not present on this host"
+    if ! zfs list "zroot/strong/strongStateDir" >/dev/null 2>&1; then
+        zfs create -p -o mountpoint=none zroot/strong/strongStateDir
+    fi
+    present=$(ssh backup "bash -c $(printf '%q' "grep -q ${BACKUP} <(sudo /usr/bin/zfs list) && echo YES || echo NO")")
+    if [[ "${present}" == "YES" ]]; then
+        echo "Backup dataset ${BACKUP} found, restoring it"
+        latest=$(ssh backup "bash -c $(printf '%q' "sudo /usr/sbin/zfs list -t snap ${BACKUP} | tail -1")")
+        latest=${latest##*@}
+        latest=${latest%% *}
+        echo "Restoring ${latest} to local"
+        ssh backup "bash -c $(printf '%q' "sudo /usr/bin/zfs send ${BACKUP}@${latest}") | gzip -9" |
+            gunzip | zfs recv -u "${SRC_DATASET}@${latest}"
+        zfs set mountpoint=legacy "${SRC_DATASET}"
+    else
+        echo "Creating a fresh dataset"
+        zfs create -p -o mountpoint=legacy "${SRC_DATASET}"
+    fi
+    CREATED=TRUE
+fi
+
+if ! zfs mount | grep -q "zroot/strong/strongStateDir/${NAME}"; then
+    echo "Mounting the dataset"
+    mount -t zfs "${SRC_DATASET}" "/strongStateDir/${NAME}"
+fi
+
+if [[ "$CREATED" = "TRUE" ]]; then
+    echo "Chowning the contents of the dataset after creation"
+    chown "${USR}":"${GROUP}" "/strongStateDir/${NAME}"
+    chmod 775 "/strongStateDir/${NAME}"
+fi
+echo "Done: ${SRC_DATASET} is mounted at /strongStateDir/${NAME}"
+
