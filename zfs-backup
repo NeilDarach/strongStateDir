@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+set -euox pipefail
+
+# Take a snapshot of a zfs dataset and send it to a remote server.
+# If the destination already has this dataset, send incremental snapshots from the latest common ancester forwards.
+# If the dataset doesn't exist, send a full snapshot
+
+usage() {
+    echo "$0 src-dataset:dst-dataset"
+    echo " e.g. zroot_strong_strongStateDir_gitea:datapool_backups_gitea"
+}
+
+if [[ $# != 1 ]]; then
+    usage
+    exit 1
+fi
+echo "\$1 is $1"
+IFS=':' read -ra ARGS <<<"$1"
+SRC_DATASET="zroot/strong/strongStateDir/${ARGS[0]}"
+DST_DATASET="datapool/backups/${ARGS[1]}"
+
+date=$(date +"%Y-%m-%d-%H-%M-%S:")
+current_month=$(date +"%m")
+snapshot_month=$( (zfs list -t snapshot -s creation "${SRC_DATASET}" 2>/dev/null || true) | tail -1 | sed -e "s/.*@[0-9]\{4\}-\([0-9]\{2\}\).*/\1/")
+if [[ "${snapshot_month}" = "${current_month}" ]]; then
+    suffix="_weekly"
+else
+    suffix="_monthly"
+fi
+# Create a snapshot of the source dataset
+zfs snapshot "${SRC_DATASET}@${date}${suffix}"
+echo "Created the snapshot ${SRC_DATASET}@${date}${suffix}"
+
+# If there is a filesystem on the destination, then we need to know which snapshots it has
+# otherwise create an empty one
+present=$(ssh backup "bash -c $(printf '%q' "grep -q ${DST_DATASET} <(sudo /usr/bin/zfs list) && echo YES || echo NO")")
+if [[ "${present}" == "NO" ]]; then
+    ssh backup "bash -c $(printf '%q' "sudo /usr/sbin/zfs create -p ${DST_DATASET%/*}")"
+    echo "Created destination filesystem ${DST_DATASET}"
+    earliest=$(zfs list -t snap ${SRC_DATASET} -S creation | tail -1)
+    earliest=${earliest##*@}
+    earliest=${earliest%% *}
+
+    zfs send "${SRC_DATASET}@${earliest}" | gzip -9 |
+        ssh backup "bash -c $(printf '%q' "gunzip | sudo /usr/sbin/zfs recv -u ${DST_DATASET}")"
+    echo "Sent snapshot ${SRC_DATASET}@${earliest}"
+else
+    #if the filesystem is mounted, then unmout it
+    result=$(ssh backup "bash -c $(printf '%q' "sudo /usr/sbin/zfs mount | grep -q ${DST_DATASET} && echo YES || echo NO")")
+    if [[ "${result}" == "YES" ]]; then
+        ssh backup "bash -c $(printf '%q' "sudo /usr/sbin/zfs umount ${DST_DATASET}")"
+    fi
+    echo "Unmounted destination filesystem"
+fi
+
+latest=$(ssh backup "bash -c $(printf '%q' "sudo /usr/sbin/zfs list -t snap ${DST_DATASET} | tail -1")")
+latest=${latest##*@}
+latest=${latest%% *}
+echo "Backing up ${latest} to ${date}"
+if [[ "${latest}" != "${date}${suffix}" ]]; then
+    zfs send -I "${SRC_DATASET}@${latest}" "${SRC_DATASET}@${date}${suffix}" | gzip -9 |
+        ssh backup "bash -c $(printf '%q' "gunzip | sudo /usr/sbin/zfs recv -u ${DST_DATASET}")"
+fi
+
